@@ -1,0 +1,372 @@
+#!/usr/bin/env python3
+"""Experiment 1: zero-shot symmetric tree-emission eval on the compose probe.
+
+Protocol (pre-declared in the worklog before any model call):
+- identical prompt for every arm: grammar spec + field catalogue + conventions
+  + 2 format-only anchors (old-style single-op trees; no novel composition shown)
+- single call per question, temperature 0, NO guided decoding (prompt-only JSON,
+  parse + validate; symmetric across local and API arms), no repair loop
+- answerable rows: correct iff the emitted tree validates, evaluates, and its
+  answer matches the dual-verified oracle; abstention on answerable = wrong
+- out-of-grammar controls (P1/P2): correct iff the model abstains
+- report: accuracy per template family and distance band + tree-validity rate
+
+Usage:
+  .venv/bin/python scripts/run_compose_probe_eval.py --arm student \
+      --base-url http://127.0.0.1:8000/v1 --model cicada-qwen3-dpo
+  .venv/bin/python scripts/run_compose_probe_eval.py --arm teacher \
+      --base-url https://.../openai/v1 --api-key-env AZURE_OPENAI_API_KEY \
+      --model grok-4-1-fast-non-reasoning
+"""
+from __future__ import annotations
+
+import argparse
+import importlib.util
+import json
+import os
+import re
+import sys
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
+
+from procurement_graph.compose.algebra import AlgebraError, validate_tree  # noqa: E402
+from procurement_graph.compose.eval_runtime import RuntimeAlgebraEvaluator  # noqa: E402
+from procurement_graph.qa.benchmark.kg_interface import ParquetKGQueryBackend  # noqa: E402
+
+_reg = importlib.util.spec_from_file_location("reg1", ROOT / "scripts/compose_regression.py")
+reg1 = importlib.util.module_from_spec(_reg)
+_reg.loader.exec_module(reg1)
+_match = reg1._match
+
+SYSTEM_PROMPT = """You answer questions about a knowledge graph of UK public procurement contract-award notices by writing a QUERY PLAN in a small typed algebra. You never answer from memory: you only write a plan; a deterministic engine executes it.
+
+RECORD UNIVERSE: one row per contract-award notice. Queryable fields:
+- contract_node_id (string id)
+- buyer_name (string; canonical buyer organisation, first of sorted names)
+- supplier_name (string; first-listed supplier organisation)
+- release_year (integer, e.g. 2024)
+- tender_category (one of: "goods", "services", "works")
+- tender_cpv_id (8-digit CPV code as string, e.g. "45233000"; numeric range queries allowed)
+- tender_title (string)
+- value_amount (number, GBP)
+- value_is_additive (boolean; true when the money value may be summed — ALWAYS filter on this before summing money)
+- award_date_signed (ISO date string) and has_award_signed_date (boolean)
+
+ALGEBRA (JSON). Types: RECORDS, VALUES (distinct scalars), GROUPS (key->number), NUMBER, VALUE, BOOL, RANKING.
+Nodes:
+  {"node":"filter","where":[PRED...]}                                   -> RECORDS (AND of predicates over the whole universe)
+  {"node":"values","of":RECORDS,"field":F}                              -> VALUES (distinct non-empty)
+  {"node":"count","of":RECORDS}                                         -> NUMBER (deduplicated record count)
+  {"node":"size","of":VALUES}                                           -> NUMBER
+  {"node":"sum","of":RECORDS,"field":F}                                 -> NUMBER
+  {"node":"exists","of":RECORDS}                                        -> BOOL
+  {"node":"select","of":RECORDS,"field":F}                              -> VALUE (must be unique)
+  {"node":"extreme","of":RECORDS,"op":"argmax"|"argmin","field":F}      -> VALUE (contract_node_id of the extremum record)
+  {"node":"groupby","of":RECORDS,"key":F,"metric":"count"|"sum","field":F-if-sum} -> GROUPS (empty keys excluded)
+  {"node":"argext","of":GROUPS,"op":"argmax"|"argmin"}                  -> VALUE (the group key)
+  {"node":"top","of":GROUPS,"k":int}                                    -> RANKING [[key,value],...]
+  {"node":"num","value":number}                                         -> NUMBER (literal)
+  {"node":"combine","op":"gt"|"lt"|"ge"|"le"|"eq","left":NUMBER,"right":NUMBER} -> BOOL
+  {"node":"combine","op":"diff"|"ratio"|"add","left":NUMBER,"right":NUMBER}     -> NUMBER
+  {"node":"vcompare","op":"gt"|"lt"|"ge"|"le"|"eq","of":VALUE,"value":literal,"normalize":"date"?} -> BOOL
+  {"node":"setop","op":"union"|"intersect"|"difference","left":VALUES,"right":VALUES} -> VALUES
+  {"node":"gcombine","op":"gt"|"diff"|"ratio","left":GROUPS,"right":GROUPS} -> GROUPS (aligned on keys, missing=0; "gt" gives 1.0/0.0)
+  {"node":"keys_where","of":GROUPS,"op":"gt"|"ge"|"lt"|"le"|"eq","value":number} -> VALUES (keys passing the test)
+Predicates (inside filter.where):
+  {"field":F,"op":"eq"|"in"|"contains"|"gte"|"lte","value":V}
+  {"field":F,"op":"exists"}
+  {"op":"not","pred":PRED}
+  {"op":"any","preds":[PRED,PRED,...]}          (logical OR)
+  {"field":F,"op":"in_expr","expr":<VALUES subtree>}            (membership in a computed set)
+  {"field":F,"op":"in_expr","expr":<VALUES subtree>,"negate":true} (NOT in the computed set)
+Nodes compose freely as long as the types match. Max depth 16, max 64 nodes.
+
+CONVENTIONS: counts are automatically deduplicated; grouping drops empty keys; money sums require an explicit {"field":"value_is_additive","op":"eq","value":true} predicate; ties rank by (-value, key).
+
+OUTPUT CONTRACT: reply with ONE JSON object and nothing else.
+- To answer: {"tree": {...}}
+- If the question cannot be expressed in this algebra (no valid tree computes it): {"abstain": true, "reason": "<short reason>"}
+
+FORMAT EXAMPLES (simple, for output shape only):
+Q: How many services contract notices did Transport for London publish in 2023?
+{"tree": {"node":"count","of":{"node":"filter","where":[{"field":"buyer_name","op":"eq","value":"Transport for London"},{"field":"tender_category","op":"eq","value":"services"},{"field":"release_year","op":"eq","value":2023}]}}}
+Q: Which suppliers received contract notices from Leeds City Council in 2024?
+{"tree": {"node":"values","of":{"node":"filter","where":[{"field":"buyer_name","op":"eq","value":"Leeds City Council"},{"field":"release_year","op":"eq","value":2024}]},"field":"supplier_name"}}"""
+
+
+_GUARD_FIELDS = {"value_is_additive", "has_award_signed_date", "has_contract_period"}
+
+
+def _literals_faithful(tree, question: str) -> bool:
+    """Every user-facing literal in the tree must occur in the question text
+    (case-insensitive). Guard flags and computed in_expr memberships exempt."""
+    q = question.casefold()
+
+    def walk(node) -> bool:
+        if isinstance(node, dict):
+            if node.get("op") in ("eq", "in", "contains", "gte", "lte") and "value" in node:
+                if node.get("field") in _GUARD_FIELDS:
+                    return True
+                values = node["value"] if isinstance(node["value"], list) else [node["value"]]
+                for v in values:
+                    if isinstance(v, bool):
+                        continue
+                    if str(v).casefold() not in q:
+                        return False
+                return True
+            return all(walk(v) for v in node.values())
+        if isinstance(node, list):
+            return all(walk(v) for v in node)
+        return True
+
+    return walk(tree)
+
+
+def _extract_json(text: str):
+    text = text.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```[a-z]*\s*|\s*```$", "", text, flags=re.S)
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    depth, start = 0, -1
+    for i, ch in enumerate(text):
+        if ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0 and start >= 0:
+                try:
+                    return json.loads(text[start:i + 1])
+                except json.JSONDecodeError:
+                    start = -1
+    return None
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--arm", required=True)
+    ap.add_argument("--base-url", required=True)
+    ap.add_argument("--model", required=True)
+    ap.add_argument("--api-key-env", default="")
+    ap.add_argument("--probe", default="data/qa/compose_probe_v1/probe.jsonl")
+    ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--concurrency", type=int, default=8)
+    ap.add_argument("--max-tokens", type=int, default=1200)
+    ap.add_argument("--resume", action="store_true",
+                    help="keep prior non-api_error results; redo only api_error rows")
+    ap.add_argument("--guided", action="store_true",
+                    help="supplementary protocol: enforce the recursive algebra schema "
+                         "via guided decoding (local vLLM arms only; breaks teacher symmetry)")
+    ap.add_argument("--system-suffix", default="",
+                    help="path to text appended to the system prompt (few-shot boundary arms)")
+    ap.add_argument("--reflect", type=int, default=0,
+                    help="max typed-feedback repair rounds. ORACLE-BLIND and "
+                         "abstention-safe: reflects only unparseable/no_tree, "
+                         "type-checker rejections, and malformed-plan runtime "
+                         "errors; abstain, answered, multiple_answers, "
+                         "no_results/no_groups are FINAL states, never reflected")
+    ap.add_argument("--old-benchmark-abstention", action="store_true",
+                    help="PRE-DECLARED mapping of old-benchmark abstention semantics: "
+                         "unsupported -> abstain only; ambiguous -> abstain OR runtime "
+                         "multiple_answers; no_results -> abstain OR empty/zero answer")
+    args = ap.parse_args()
+    global SYSTEM_PROMPT
+    if args.system_suffix:
+        SYSTEM_PROMPT = SYSTEM_PROMPT + Path(args.system_suffix).read_text()
+
+    from openai import OpenAI
+    api_key = os.getenv(args.api_key_env, "") if args.api_key_env else "local"
+    client = OpenAI(base_url=args.base_url, api_key=api_key or "local", timeout=180)
+
+    rows = [json.loads(line) for line in (ROOT / args.probe).open()]
+    if args.limit:
+        rows = rows[: args.limit]
+
+    backend = ParquetKGQueryBackend.from_directory(ROOT / "data/kg", include_evidence=False)
+    ev = RuntimeAlgebraEvaluator(backend)
+
+    _SEMANTIC_REASONS = ("no_results", "no_groups")
+
+    def ask(row: dict) -> dict:
+        out = {"id": row["id"], "family": row["template_family"], "band": row["distance_band"]}
+        extra = {}
+        if args.guided:
+            from procurement_graph.compose.schema import algebra_json_schema
+            extra["response_format"] = {"type": "json_schema", "json_schema": {
+                "name": "algebra", "schema": algebra_json_schema(), "strict": True}}
+        expected_abstain = row["expected_status"] != "answerable"
+        abstain_family = str(row["expected_status"])  # 'ambiguous' | 'no_results' | 'unsupported' | ...
+        messages = [{"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": row["question"]}]
+        rounds = 0
+        while True:
+            raw = None
+            for attempt in range(5):
+                try:
+                    resp = client.chat.completions.create(
+                        model=args.model, temperature=0.0, max_tokens=args.max_tokens,
+                        messages=messages, **extra)
+                    raw = resp.choices[0].message.content or ""
+                    break
+                except Exception as exc:
+                    last_exc = exc
+                    import time
+                    time.sleep(min(60, 5 * 2 ** attempt))
+            if raw is None:
+                out.update(outcome="api_error", detail=str(last_exc)[:200], correct=False)
+                return out
+            out["raw"] = raw[:4000]
+            out["rounds"] = rounds
+            payload = _extract_json(raw)
+            feedback = None
+            tree = None
+            if payload is None:
+                out.update(outcome="unparseable", correct=False)
+                feedback = ("Your reply was not one parseable JSON object (or was cut "
+                            "off). Reply with exactly one JSON object for the same "
+                            "question; prefer a shorter plan.")
+            elif payload.get("abstain"):
+                # abstention is a legitimate FINAL state: never reflected
+                out.update(outcome="abstain", correct=expected_abstain)
+                return out
+            else:
+                tree = payload.get("tree") if isinstance(payload.get("tree"), dict) else (
+                    payload if payload.get("node") else None)
+                if tree is None:
+                    out.update(outcome="no_tree", correct=False)
+                    feedback = ('Your JSON had neither "tree" nor "abstain". Reply with '
+                                '{"tree": {...}} or {"abstain": true, "reason": "..."}.')
+                else:
+                    try:
+                        validate_tree(tree)
+                    except AlgebraError as exc:
+                        out.update(outcome="invalid_tree", detail=exc.reason,
+                                   correct=False, tree=tree)
+                        feedback = (f"Your plan was REJECTED by the type checker: "
+                                    f"{exc.reason} at {exc.path}. Fix the plan.")
+                    else:
+                        probe_res = ev.run(tree)
+                        reason = str(probe_res.get("reason", ""))
+                        if (probe_res.get("status") != "ok"
+                                and not reason.startswith("multiple_answers")
+                                and reason not in _SEMANTIC_REASONS):
+                            # malformed plan (unknown_field / eval_error / ...):
+                            # reflectable. Semantic outcomes above stay FINAL —
+                            # they carry the abstention-safety metric.
+                            out.update(outcome=f"eval_{probe_res.get('status')}",
+                                       detail=reason, correct=False, tree=tree)
+                            feedback = (f"Your plan failed at execution: {reason}. "
+                                        f"Fix the plan.")
+                        else:
+                            break  # scoreable final state
+            if feedback is None or rounds >= args.reflect:
+                return out
+            rounds += 1
+            messages = messages + [{"role": "assistant", "content": raw},
+                                   {"role": "user", "content": feedback}]
+        if expected_abstain:
+            # STRICT metric (primary): only an explicit abstain counts (handled above).
+            # SAFE metric (supplementary, faithfulness-gated): a runtime multi-answer
+            # or empty result counts ONLY if every literal in the tree traces to the
+            # question — the algebra version of the provenance gate. A wrong plan
+            # that fails by accident (over-filtering / wrong widening) scores 0.
+            out["correct"] = False
+            if args.old_benchmark_abstention:
+                result = ev.run(tree)
+                reason = str(result.get("reason", ""))
+                faithful = _literals_faithful(tree, row["question"])
+                if abstain_family == "ambiguous" and reason.startswith("multiple_answers") and faithful:
+                    out.update(outcome="faithful_multi_answer", correct=False, safe_correct=True, tree=tree)
+                    return out
+                if abstain_family == "no_results" and faithful and (
+                        reason == "no_results" or reason == "no_groups" or
+                        (result.get("status") == "ok" and result.get("answer") in (0, 0.0, False, []))):
+                    out.update(outcome="faithful_empty_result", correct=False, safe_correct=True, tree=tree)
+                    return out
+                if not faithful and (reason.startswith("multiple_answers") or reason in ("no_results", "no_groups")):
+                    out.update(outcome="unfaithful_accidental_failure", correct=False,
+                               safe_correct=False, tree=tree)
+                    return out
+            out.update(outcome="answered_out_of_grammar", correct=False, safe_correct=False, tree=tree)
+            return out
+        result = ev.run(tree)
+        if result.get("status") != "ok":
+            out.update(outcome=f"eval_{result.get('status')}", detail=result.get("reason", ""),
+                       correct=False, tree=tree)
+            return out
+        ok = _match(row["oracle_answer"], result)
+        out.update(outcome="answered", correct=bool(ok), tree=tree,
+                   answer=result["answer"], oracle=row["oracle_answer"])
+        return out
+
+    out_dir = ROOT / "data/qa/compose_probe_v1"
+    out_path = out_dir / f"eval_{args.arm}.jsonl"
+
+    kept: dict[str, dict] = {}
+    if args.resume:
+        for src in (out_path, out_dir / f"eval_{args.arm}.stream.jsonl"):
+            if src.exists():
+                for line in src.open():
+                    r = json.loads(line)
+                    if r.get("outcome") != "api_error":
+                        kept[r["id"]] = r
+        print(f"resume: keeping {len(kept)} prior results, redoing {len(rows) - len(kept)}")
+    todo = [r for r in rows if r["id"] not in kept]
+
+    # incremental stream: every finished row is appended immediately so a
+    # killed run loses nothing (final write below rewrites in probe order)
+    import threading
+    stream_path = out_dir / f"eval_{args.arm}.stream.jsonl"
+    _lock = threading.Lock()
+    _stream = stream_path.open("a")
+
+    def ask_streamed(row):
+        r = ask(row)
+        with _lock:
+            _stream.write(json.dumps(r, default=str) + "\n")
+            _stream.flush()
+        return r
+
+    with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
+        fresh = list(pool.map(ask_streamed, todo))
+    _stream.close()
+    by_id = {**kept, **{r["id"]: r for r in fresh}}
+    results = [by_id[r["id"]] for r in rows]
+    with out_path.open("w") as fh:
+        for r in results:
+            fh.write(json.dumps(r, default=str) + "\n")
+
+    fam = defaultdict(lambda: [0, 0])
+    band = defaultdict(lambda: [0, 0])
+    valid_trees = sum(1 for r in results if r.get("outcome") in ("answered", "answered_out_of_grammar"))
+    for r in results:
+        fam[r["family"]][0] += int(bool(r["correct"]))
+        fam[r["family"]][1] += 1
+        band[r["band"]][0] += int(bool(r["correct"]))
+        band[r["band"]][1] += 1
+    total_c = sum(v[0] for v in fam.values())
+    total_n = sum(v[1] for v in fam.values())
+    safe_c = sum(1 for r in results if r.get("correct") or r.get("safe_correct"))
+    summary = {"arm": args.arm, "model": args.model,
+               "accuracy": round(100 * total_c / max(1, total_n), 2),
+               "safe_accuracy": round(100 * safe_c / max(1, total_n), 2),
+               "n": total_n, "correct": total_c,
+               "tree_valid_rate": round(100 * valid_trees / max(1, total_n), 2),
+               "by_band": {k: f"{v[0]}/{v[1]}" for k, v in sorted(band.items())},
+               "by_family": {k: f"{v[0]}/{v[1]}" for k, v in sorted(fam.items())},
+               "outcomes": dict(sorted(__import__('collections').Counter(
+                   r["outcome"] for r in results).items()))}
+    (out_dir / f"summary_{args.arm}.json").write_text(json.dumps(summary, indent=1))
+    print(json.dumps(summary, indent=1))
+
+
+if __name__ == "__main__":
+    main()

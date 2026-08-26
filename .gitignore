@@ -1,0 +1,63 @@
+# Python caches and environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+.venv/
+venv/
+env/
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.pfx
+
+# Editors and operating systems
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Generated data, models, and runtime output
+data/*
+!data/README.md
+outputs/
+reports/
+logs/
+train_logs/
+tmp/
+.tmp*/
+checkpoints/
+models/
+*.sqlite3
+*.log
+
+# Packaging and notebooks
+build/
+dist/
+*.egg-info/
+.ipynb_checkpoints/
+
+# LaTeX build products (compiled PDFs remain allowed)
+*.aux
+*.bbl
+*.blg
+*.fdb_latexmk
+*.fls
+*.out
+*.synctex.gz
+*.toc
+compile.log
+bibtex.log
+
+# Archives are release artifacts, not source files
+*.zip
+*.7z
+*.tar
+*.tar.gz

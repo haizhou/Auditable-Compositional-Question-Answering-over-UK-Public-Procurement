@@ -16,8 +16,6 @@ runtime checks from offline oracle evaluation.
 | `configs/` | Project settings and selected final training configurations |
 | `tests/` | Unit and integration-style tests |
 | `docs/` | Current architecture, benchmark, data, results, and training documentation |
-| `paper/current/` | Current paper source, figures, case-study supplements, and compiled PDF |
-| `thesis/` | Dissertation LaTeX source, figures, and compiled PDF |
 | `data/` | Data inventory only; generated and large datasets are intentionally excluded |
 
 Older paper versions, experiment caches, generated training exports, local model outputs, reference
